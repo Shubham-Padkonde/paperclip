@@ -24,39 +24,13 @@ export function encodeEnvValue(value: string, encoding: EnvValueEncoding = "json
 }
 
 function trailingEnvCommentStart(rawValue: string): number | null {
-  let quote: "\"" | "'" | "`" | null = null;
-  let escaped = false;
-
-  for (let index = 0; index < rawValue.length; index += 1) {
-    const character = rawValue[index];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (character === "\\" && (quote === "\"" || (quote !== null && rawValue[index + 1] === quote))) {
-      escaped = true;
-      continue;
-    }
-    if (quote !== null) {
-      if (character === quote) quote = null;
-      continue;
-    }
-    if (character === "\"" || character === "'" || character === "`") {
-      quote = character;
-      continue;
-    }
-    // dotenv treats every unquoted # as the start of a comment, even when it
-    // immediately follows the assignment separator or the value.
-    if (character !== "#") continue;
-
-    let commentStart = index;
-    while (commentStart > 0 && /\s/.test(rawValue[commentStart - 1] ?? "")) {
-      commentStart -= 1;
-    }
-    return commentStart;
+  const quotedValue = rawValue.match(/^(?:'(?:\\'|[^'])*'|"(?:\\"|[^"])*"|`(?:\\`|[^`])*`)(?=[^\S\r\n]*(?:#[^\r\n]*)?$)/);
+  let commentStart = rawValue.indexOf("#", quotedValue?.[0].length ?? 0);
+  if (commentStart === -1) return null;
+  while (commentStart > 0 && /\s/.test(rawValue[commentStart - 1] ?? "")) {
+    commentStart -= 1;
   }
-
-  return null;
+  return commentStart;
 }
 
 function parseComparableEnvValue(rawValue: string): string | null {
@@ -85,7 +59,7 @@ function parseComparableEnvValue(rawValue: string): string | null {
 function splitEnvLines(contents: string): EnvLine[] {
   const lines: EnvLine[] = [];
   const newlinePattern = /\r\n|\n|\r/g;
-  const quotedAssignmentPattern = /^[^\S\r\n]*(?:export\s+)?[\w.-]+(?:\s*=\s*|:\s+)(?:'(?:\\'|[^'])*'|"(?:\\"|[^"])*"|`(?:\\`|[^`])*`)/gm;
+  const quotedAssignmentPattern = /^[^\S\r\n]*(?:export\s+)?[\w.-]+(?:\s*=\s*|:\s+)(?:'(?:\\'|[^'])*'|"(?:\\"|[^"])*"|`(?:\\`|[^`])*`)(?=[^\S\r\n]*(?:#[^\r\n]*)?$)/gm;
   let quotedAssignment = quotedAssignmentPattern.exec(contents);
   let lineStart = 0;
   let match: RegExpExecArray | null;

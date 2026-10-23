@@ -2,6 +2,20 @@ import { describe, expect, it } from "vitest";
 import { encodeEnvValue, updateEnvFileContents } from "./env-file.js";
 
 describe("env file editor", () => {
+  it.each(["'", '"', "`"])("preserves the next assignment after a trailing backslash in a %s value", (quote) => {
+    for (const newline of ["\n", "\r\n", "\r"]) {
+      const original = `PAPERCLIP_HOME=${quote}C:\\old\\${quote} # keep${newline}OTHER=${quote}keep${quote}${newline}`;
+      expect(updateEnvFileContents(original, { PAPERCLIP_HOME: "/new-home" }, { valueEncoding: "minimal" }))
+        .toBe(`PAPERCLIP_HOME=/new-home # keep${newline}OTHER=${quote}keep${quote}${newline}`);
+    }
+  });
+
+  it.each(["'", '"', "`"])("preserves comments after an unquoted path containing %s", (quote) => {
+    const original = `PAPERCLIP_HOME=/old${quote}dir # keep this comment\n`;
+    expect(updateEnvFileContents(original, { PAPERCLIP_HOME: "/new-home" }, { valueEncoding: "minimal" }))
+      .toBe("PAPERCLIP_HOME=/new-home # keep this comment\n");
+  });
+
   it.each(["'", '"', "`"])("preserves unrelated multiline %s values when adding a managed key", (quote) => {
     const original = `OPERATOR_NOTES=${quote}first line\nPAPERCLIP_HOME=/example\nlast line${quote}\n`;
 
