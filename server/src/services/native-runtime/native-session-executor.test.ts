@@ -11196,6 +11196,32 @@ describe("runnerd provider runtime wiring", () => {
     } finally {owner.mockRestore();await rm(home,{recursive:true,force:true});}
   });
 
+  it.each([true,false])("reconnects task-only warm recovery under the saved identity before reuse or retirement: %s", async reuseProcess => {
+    const current=scopedNativeExecution(`plugin-restart-${reuseProcess}`);
+    current.session.lifecyclePolicy={mode:"warm",idleTimeoutMs:300000};
+    const identity={runnerInstanceId:"old-runner",environmentLeaseId:"old-lease",runId:"old-run",
+      normalizedSessionId:current.session.normalizedSessionId!,turnId:"old-turn",itemId:"old-item"};
+    const home=await mkdtemp(join(tmpdir(),"plugin-restart-account-"));
+    await writeFile(join(home,"auth.json"),JSON.stringify({OPENAI_API_KEY:"synthetic-fixture"}),{mode:0o600});
+    const owner=vi.spyOn(pluginTaskRuntime,"createPluginRunnerTaskOwner");
+    const task=vi.fn(async()=>({kind:"description",taskId:"saved-task",launchPreparationVersion:1,projectAuthCheckVersion:1,
+      warmTaskVersion:1,runner:{version:"fixture",digest:`sha256:${"a".repeat(64)}`}}));
+    state.createBackend.mockClear();state.createTransport.mockClear();
+    try {
+      await createRunnerdBackend({db:leaseDb(current),execution:current,runnerInstanceId:"new-runner",runnerIngressAuthorized:true,
+        managedAiCredentialHome:home,managedAiCredentialIdentity:reuseProcess ? "old-revision" : "new-revision",managedAiAccountIdentity:"account",
+        managedAiCredentialWriteback:{} as never,
+        remoteWarmRecovery:{identity,reuseProcess,previousExecution:current,checkpoint:{} as never,
+          remote:{providerLeaseId:"saved-task",remoteCwd:"."},revalidate:async()=>{}},
+        runnerExecutionTarget:{kind:"remote",transport:"sandbox",leaseId:"new-lease",remoteCwd:".",runnerTask:task,
+          sandboxLeaseAcquisition:{outcome:"resumed",providerLeaseId:"saved-task"}}});
+      state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      expect(state.createTransport.mock.calls.at(-1)![0].prpIdentity).toEqual(identity);
+      expect(owner.mock.calls.at(-1)![0].adoptIdentity).toEqual(identity);
+      expect(task.mock.calls).toEqual([[{kind:"describe"}]]);
+    } finally {owner.mockRestore();await rm(home,{recursive:true,force:true});}
+  });
+
   it("keeps assigned MCP credentials on the control plane for remote Codex", async () => {
     const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
     vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test");

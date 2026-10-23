@@ -60,6 +60,11 @@ export function createPluginRunnerTaskOwner(input: {
   };
   const prepareLaunch: RunnerLaunchPreparer = async (requirements, recovery) => {
     if (released || stopRequested) throw new Error("Plugin Runner preparation cancelled");
+    // Reconnecting the previous authority must not prepare it through the new run's lease.
+    if (recovery && input.adoptIdentity && Object.entries(input.adoptIdentity).every(([key,value]) => requirements.identity[key as keyof DurableRecoveryIdentity] === value)) {
+      preparedLaunchId = recovery.configurationId;
+      return recovery;
+    }
     const result = await call(environmentTaskOperationSchema.parse({ kind: "prepare", requirements,
       projectIds: [...input.projectIds], ...(recovery ? { recovery } : {}),
       ...(input.resumeFrom ? { resumeFrom: input.resumeFrom } : {}),

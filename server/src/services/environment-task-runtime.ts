@@ -1,3 +1,6 @@
+import { environmentService } from "./environments.js";
+import { createSandboxOrphanCleanupSpool, type DeferredOrphanCleanupRecord } from "./sandbox-orphan-cleanup-spool.js";
+import { logger } from "../middleware/logger.js";
 import { releaseProviderRecoveryTransfers, stageProviderFreshWorkspace } from "./provider-fresh-workspace.js";
 import { readWorkspaceProviderBinding } from "@paperclipai/shared";
 import { settlePluginTaskCredentialHandoff } from "./plugin-task-credential-writeback.js";
@@ -58,22 +61,20 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
   const scopesProjects = launches || operation.kind === "check_project_auth" || operation.kind === "read_file";
   const resumeFrom = launches || checkpointIdentity ? (operation as { resumeFrom?: string }).resumeFrom : undefined;
   const savedIdentity = metadata.runnerTaskIdentity as Record<string, unknown> | undefined;
-  const ownCheckpoint = checkpointIdentity && !resumeFrom && savedIdentity
-    && savedIdentity.runnerId === checkpointIdentity.runnerInstanceId && savedIdentity.leaseId === checkpointIdentity.environmentLeaseId
-    && savedIdentity.runId === checkpointIdentity.runId && savedIdentity.sessionId === checkpointIdentity.normalizedSessionId
-    && savedIdentity.turnId === checkpointIdentity.turnId && savedIdentity.itemId === checkpointIdentity.itemId;
-  if (checkpointIdentity && !resumeFrom && !ownCheckpoint) throw new Error("Plugin Runner state identity mismatch");
   const prior = operation.kind === "prepare" ? operation.priorIdentity : undefined;
   const priorSaved = metadata.runnerTaskPriorIdentity as Record<string, unknown> | undefined;
   const matches = (identity: typeof prior, saved: Record<string, unknown> | undefined) => !!identity && !!saved &&
     identity.runnerInstanceId === saved.runnerId && identity.environmentLeaseId === saved.leaseId &&
     identity.normalizedSessionId === saved.sessionId && identity.runId === saved.runId &&
     identity.turnId === saved.turnId && identity.itemId === saved.itemId;
+  const ownCheckpoint = checkpointIdentity && !resumeFrom &&
+    (matches(checkpointIdentity,savedIdentity) || operation.kind !== "read_file" && matches(checkpointIdentity,priorSaved));
+  if (checkpointIdentity && !resumeFrom && !ownCheckpoint) throw new Error("Plugin Runner state identity mismatch");
   const warmAttachment = !!prior && metadata.runnerTaskReused === true &&
     (matches(prior, savedIdentity) || matches(prior, priorSaved) && operation.kind === "prepare" && matches(operation.requirements.identity, savedIdentity)) && runner?.runnerId === prior.runnerInstanceId &&
     runner?.leaseId === prior.environmentLeaseId && runner?.sessionId === prior.normalizedSessionId;
   if (prior && !warmAttachment) throw new Error("Plugin warm task prior identity mismatch");
-  if (runner && ((!checkpointIdentity || !resumeFrom) && runner.runId !== (activeProbe ? probe.runId : run?.id) || (!resumeFrom && runner.leaseId !== lease.id && !ownCheckpoint && !warmAttachment)
+  if (runner && ((!checkpointIdentity || !resumeFrom) && !(ownCheckpoint && operation.kind !== "read_file") && runner.runId !== (activeProbe ? probe.runId : run?.id) || (!resumeFrom && runner.leaseId !== lease.id && !ownCheckpoint && !warmAttachment)
     || (activeProbe && (runner.sessionId !== probe.sessionId || (launches && operation.projectIds.length > 0))))) {
     throw new Error("Plugin-provided Runner execution identity mismatch");
   }
@@ -211,12 +212,33 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
         if (!fresh.providerLeaseId || fresh.providerLeaseId === taskId) throw new Error("Plugin replacement task identity unavailable");
         const {runnerTaskIdentity:_identity,runnerTaskPriorIdentity:_prior,runnerTaskCredentialHandoff:_handoff,
           runnerTaskResumeFrom:_resume,runnerTaskPreviousLeaseId:_previous,...rest}=metadata;
-        const replacement = await db.update(environmentLeases).set({providerLeaseId:fresh.providerLeaseId,
-          metadata:{...rest,providerMetadata:fresh.metadata ?? {},runnerTaskReused:false,runnerTaskDispatched:false,
-            runnerTaskExecutionStopped:false,runnerTaskSessionRetained:false},
-        }).where(and(eq(environmentLeases.id,lease.id),eq(environmentLeases.providerLeaseId,taskId),
-          eq(environmentLeases.status,"active"))).returning({id:environmentLeases.id});
-        if (replacement.length !== 1) throw new Error("Plugin task replacement ownership changed");
+        const replacementMetadata={...rest,providerMetadata:fresh.metadata ?? {},runnerTaskReused:false,runnerTaskDispatched:false,
+          runnerTaskExecutionStopped:false,runnerTaskSessionRetained:false};
+        try {
+          const replacement = await db.update(environmentLeases).set({providerLeaseId:fresh.providerLeaseId,
+            metadata:replacementMetadata,
+          }).where(and(eq(environmentLeases.id,lease.id),eq(environmentLeases.providerLeaseId,taskId),
+            eq(environmentLeases.status,"active"))).returning({id:environmentLeases.id});
+          if (replacement.length !== 1) throw new Error("Plugin task replacement ownership changed");
+        } catch (error) {
+          try {
+            await workers.call(plugin.id,"environmentReleaseLease",{driverKey:metadata.driverKey,companyId:input.companyId,
+              environmentId:environment!.id,issueId:lease.issueId,config:driverConfig,providerLeaseId:fresh.providerLeaseId,
+              leaseMetadata:replacementMetadata});
+          } catch {
+            const orphan:DeferredOrphanCleanupRecord={companyId:input.companyId,environmentId:environment!.id,
+              executionWorkspaceId:lease.executionWorkspaceId,issueId:lease.issueId,heartbeatRunId:lease.heartbeatRunId,
+              provider:lease.provider!,providerLeaseId:fresh.providerLeaseId,metadata:replacementMetadata};
+            try {
+              await environmentService(db).insertPendingCleanupLease({...orphan,failureReason:"plugin_task_replacement_unowned"});
+            } catch {
+              // The existing orphan spool recovers cleanup even when the database is unavailable.
+              const persisted=await createSandboxOrphanCleanupSpool().append(orphan);
+              logger.error({providerLeaseId:fresh.providerLeaseId,persisted},"Plugin replacement cleanup requires recovery");
+            }
+          }
+          throw error;
+        }
         return executeEnvironmentTask(db, workers, input);
       }
     }

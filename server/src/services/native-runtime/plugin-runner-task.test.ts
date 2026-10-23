@@ -355,6 +355,9 @@ it("adopts a verified retained Codex task without submitting a replacement", asy
   ingress.connect.mockReturnValue({ready:Promise.resolve(),close:async()=>{}});
   const owner=createPluginRunnerTaskOwner({task,projectIds:[],harness:"codex",projectAuthCheckVersion:1,
     warmTaskVersion:1,accountIdentity:"account",adoptIdentity:requirements.identity,pollMs:1});
+  const recovered = {configurationId:"saved",requirementsDigest:`sha256:${"a".repeat(64)}`,provider:{}};
+  await expect(owner.driver.prepareLaunch!(requirements,recovered)).resolves.toEqual(recovered);
+  expect(task).not.toHaveBeenCalled();
   expect(await owner.driver.adoptExistingRunner!.isAlive()).toBe(true);
   const registration=await owner.registration({} as never,"run");
   registration.activate(); await registration.ready();

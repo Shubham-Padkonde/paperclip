@@ -11822,7 +11822,14 @@ async function createRunnerdBackendWithinSessionClaim(
     if (description.kind !== "description" || description.launchPreparationVersion !== 1 || description.projectAuthCheckVersion !== 1) throw new Error("Plugin Runner launch preparation v1 unavailable");
     const prior = durableBinding ? durableIdentity as RunnerdDurableIdentity : undefined;
     const retainedOwner = input.retainedPluginTaskOwner;
-    const adopting = input.remoteWarmRecovery?.reuseProcess === true;
+    const adopting = input.remoteWarmRecovery !== undefined;
+    const adoptionIdentity = input.remoteWarmRecovery ? {
+      runnerInstanceId: input.remoteWarmRecovery.identity.runnerInstanceId,
+      environmentLeaseId: input.remoteWarmRecovery.identity.environmentLeaseId,
+      runId: input.remoteWarmRecovery.identity.runId,
+      normalizedSessionId: input.remoteWarmRecovery.identity.normalizedSessionId,
+      turnId: input.remoteWarmRecovery.identity.turnId, itemId: input.remoteWarmRecovery.identity.itemId,
+    } : undefined;
     const resumeFrom = !retainedOwner && !adopting && prior && prior.environmentLeaseId !== remoteTarget.leaseId
       ? await resolvePluginTaskResume(input.db, { companyId: input.execution.binding.companyId,
           leaseId: remoteTarget.leaseId!, priorIdentity: prior }) : undefined;
@@ -11832,7 +11839,7 @@ async function createRunnerdBackendWithinSessionClaim(
       home: input.managedAiCredentialHome, environment: input.runnerEnvironment ?? {},
     });
     if (credentials.needsWriteback && !input.managedAiCredentialWriteback) throw new Error("Plugin Runner credential writeback authority unavailable");
-    if (input.managedAiCredentialWriteback && credentials.accountIdentity) {
+    if (!adopting && input.managedAiCredentialWriteback && credentials.accountIdentity) {
       if (!remoteTarget.leaseId) throw new Error("Plugin Runner credential lease unavailable");
       await registerPluginTaskCredentialHandoff(input.db, { companyId: input.execution.binding.companyId, leaseId: remoteTarget.leaseId },
         credentials.accountIdentity, input.managedAiCredentialWriteback);
@@ -11841,8 +11848,7 @@ async function createRunnerdBackendWithinSessionClaim(
       // Warm retirement can outlive the run's temporary credential home; complete uses the durable handoff.
       onCredentials: input.execution.session.lifecyclePolicy.mode === "warm" ? undefined : credentials.onCredentials,
       warmTaskVersion: description.warmTaskVersion,
-      adoptIdentity: adopting && prior ? { runnerInstanceId: prior.runnerInstanceId, environmentLeaseId: prior.environmentLeaseId,
-        runId: prior.runId, normalizedSessionId: prior.normalizedSessionId, turnId: String(prior.turnId), itemId: String(prior.itemId) } : undefined, projectAuthCheckVersion: description.projectAuthCheckVersion, task: pluginTask, projectIds: remoteTarget.runnerTaskProjectIds ?? [],
+      adoptIdentity: adoptionIdentity, projectAuthCheckVersion: description.projectAuthCheckVersion, task: pluginTask, projectIds: remoteTarget.runnerTaskProjectIds ?? [],
       harness: provider.kind === "acpx" ? provider.agent : provider.kind, resumeFrom, priorIdentity: prior ? {
         runnerInstanceId: prior.runnerInstanceId, environmentLeaseId: prior.environmentLeaseId,
         runId: prior.runId, normalizedSessionId: prior.normalizedSessionId,
@@ -11894,7 +11900,7 @@ async function createRunnerdBackendWithinSessionClaim(
         resumeDynamicTools: dynamicTools, resumeCompletionContract: { revision: input.execution.completionContract.contract.revision,
           criterionIds: input.execution.completionContract.contract.criteria.map(criterion => criterion.id) },
         resumeActiveTurnId: recovery?.persistedSession?.activeTurnId ?? null, resumeProviderSession: recovery?.persistedSession,
-        prpIdentity: { runnerInstanceId: prior?.runnerInstanceId ?? effectiveRunnerInstanceId,
+        prpIdentity: adoptionIdentity ?? { runnerInstanceId: prior?.runnerInstanceId ?? effectiveRunnerInstanceId,
           environmentLeaseId: prior?.environmentLeaseId ?? effectiveEnvironmentLeaseId,
           runId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution),
           turnId: `turn-${input.execution.binding.runId}`, itemId: `item-${input.execution.binding.runId}` },

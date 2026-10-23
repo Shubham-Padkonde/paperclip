@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { agents, companies, createDb, environmentLeases, environments, heartbeatRuns, issues, plugins } from "@paperclipai/db";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
+import * as orphanCleanup from "../services/sandbox-orphan-cleanup-spool.js";
 import { resolvePluginTaskResume } from "../services/environment-task-runtime.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -14,7 +15,7 @@ const support=await getEmbeddedPostgresTestSupport();
  afterAll(async()=>{await stop?.();});
  async function fixture(){
   const companyId=randomUUID(),agentId=randomUUID(),issueId=randomUUID(),environmentId=randomUUID(),pluginId=randomUUID();
-  let runId=randomUUID(),allocation=0,stopped=false,outage=false;
+  let runId=randomUUID(),allocation=0,stopped=false,outage=false,releaseFails=false;
   const calls:string[]=[];
   let resumeGate:Promise<void>|undefined,releaseResume:(()=>void)|undefined,resumes=0;
   await db.insert(companies).values({id:companyId,name:"Warm fixture",issuePrefix:`W${companyId.slice(0,7)}`});
@@ -32,8 +33,9 @@ const support=await getEmbeddedPostgresTestSupport();
     if(method==="environmentAcquireLease") return {providerLeaseId:`task-${++allocation}`,metadata:{runId:p.runId}};
     if(method==="environmentResumeLease") {if(outage) throw Error("unreachable");
      if(resumeGate){if(++resumes===2)releaseResume!();await resumeGate;}return {providerLeaseId:stopped?null:p.providerLeaseId,metadata:{runId:p.runId}};}
-    if(method==="environmentReleaseLease") return {providerLeaseId:p.providerLeaseId,state:"stopped"};
+    if(method==="environmentReleaseLease") {if(releaseFails) throw Error("release unavailable");return {providerLeaseId:p.providerLeaseId,state:"stopped"};}
     if(p.operation.kind==="status") return {kind:"status",taskId:p.taskId,phase:stopped?"completed":"running",executionStopped:stopped,sessionStateAvailable:stopped};
+    if(p.operation.kind==="read_state") return {kind:"state",taskId:p.taskId,state:{...p.operation.identity,lifecycle:"ready"}};
     if(p.operation.kind==="stop") stopped=true;
     if(p.operation.kind==="prepare") return {kind:"prepared",taskId:p.taskId,launch:{configurationId:"configuration",requirementsDigest:`sha256:${"a".repeat(64)}`,provider:{}}};
     if(p.operation.kind==="check_project_auth") return {kind:"project_auth",taskId:p.taskId,configurationId:p.operation.configurationId,provider:"openai",allowed:true};
@@ -52,7 +54,7 @@ const support=await getEmbeddedPostgresTestSupport();
   await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,runId));
   return {companyId,first,identity,calls,runtime,acquire,
    async nextRun(){runId=randomUUID();await db.insert(heartbeatRuns).values({id:runId,companyId,agentId,nativeIssueId:issueId,invocationSource:"manual",status:"running"});return runId;},
-   stopped(){stopped=true;},outage(){outage=true;},
+   stopped(){stopped=true;},failRelease(){releaseFails=true;},outage(){outage=true;},
    raceResume(){resumeGate=new Promise<void>(resolve=>{releaseResume=resolve;});}};
  }
  it("hands a retained process to a new run after controller reconstruction",async()=>{
@@ -65,9 +67,12 @@ const support=await getEmbeddedPostgresTestSupport();
   const identity={...f.identity,runId,turnId:"next-turn",itemId:"next-item"};
   const operation={kind:"prepare" as const,projectIds:[],priorIdentity:f.identity,accountIdentity:"account",requirements:{
    schema:"paperclip.runner.launch-requirements.v1" as const,identity,provider:"codex" as const,model:null,instructions:"Current run",runtimeContext:null,settings:{},approvalPolicy:"never" as const,readOnly:false,preparedConversation:false,includeCollaborationModeInstructions:false}};
+  await expect(f.runtime().task({companyId:f.companyId,leaseId:next.lease.id,operation:{kind:"read_state",identity:f.identity}})).resolves.toMatchObject({kind:"state"});
   await expect(f.runtime().task({companyId:f.companyId,leaseId:next.lease.id,operation})).resolves.toMatchObject({kind:"prepared"});
   await expect(f.runtime().task({companyId:f.companyId,leaseId:next.lease.id,operation})).resolves.toMatchObject({kind:"prepared"});
   await expect(f.runtime().task({companyId:f.companyId,leaseId:next.lease.id,operation:{...operation,priorIdentity:{...f.identity,itemId:"foreign"}}})).rejects.toThrow("prior identity mismatch");
+  await expect(f.runtime().task({companyId:f.companyId,leaseId:next.lease.id,operation:{kind:"read_state",identity:f.identity}})).resolves.toMatchObject({kind:"state"});
+  await expect(f.runtime().task({companyId:f.companyId,leaseId:next.lease.id,operation:{kind:"read_state",identity:{...f.identity,itemId:"foreign"}}})).rejects.toThrow("state identity mismatch");
   expect(f.calls.filter(call=>call==="submit")).toHaveLength(1);
   const [old]=await db.select().from(environmentLeases).where(eq(environmentLeases.id,f.first.lease.id));
   expect(old.status).toBe("expired");
@@ -96,6 +101,31 @@ const support=await getEmbeddedPostgresTestSupport();
   const result=await f.runtime().task({companyId:f.companyId,leaseId:next.lease.id,operation:{kind:"describe"}});
   expect(result.taskId).not.toBe(f.first.lease.providerLeaseId);
   await expect(resolvePluginTaskResume(db,{companyId:f.companyId,leaseId:next.lease.id,priorIdentity:f.identity})).resolves.toBe(f.first.lease.providerLeaseId);
+ });
+
+ it.each(["ownership-lost","database-error","cleanup-error","spool"] as const)("compensates an unowned replacement task: %s",async mode=>{
+  const f=await fixture();await f.nextRun();const next=await f.acquire();f.stopped();
+  if(mode==="cleanup-error" || mode==="spool") f.failRelease();
+  const append=vi.fn(async()=>true);
+  const spool=mode==="spool" ? vi.spyOn(orphanCleanup,"createSandboxOrphanCleanupSpool").mockReturnValue({append,load:async()=>[],remove:async()=>{}}) : undefined;
+  const transaction=mode==="spool" ? vi.spyOn(db,"transaction").mockRejectedValue(Error("database unavailable")) : undefined;
+  const original=db.update.bind(db);
+  const update=vi.spyOn(db,"update").mockImplementation(((table:any)=>{
+   const query=original(table),set=query.set.bind(query);
+   query.set=((values:any)=>values.providerLeaseId === "task-2"
+    ? {where:()=>({returning:async()=>{if(mode!=="ownership-lost") throw Error("replacement write failed");return [];}})}
+    : set(values)) as never;
+   return query;
+  }) as never);
+  try {
+   await expect(f.runtime().task({companyId:f.companyId,leaseId:next.lease.id,operation:{kind:"describe"}}))
+    .rejects.toThrow("reconcile the same task");
+  } finally {update.mockRestore();transaction?.mockRestore();spool?.mockRestore();}
+  expect(f.calls).toContain("environmentReleaseLease");
+  if(mode==="spool") expect(append).toHaveBeenCalledWith(expect.objectContaining({providerLeaseId:"task-2",metadata:expect.objectContaining({driver:"plugin",runnerTaskDispatched:false})}));
+  const rows=await db.select().from(environmentLeases).where(eq(environmentLeases.companyId,f.companyId));
+  expect(rows.filter(row=>row.providerLeaseId === "task-2")).toEqual(mode==="cleanup-error"
+   ? [expect.objectContaining({status:"pending_cleanup",failureReason:"plugin_task_replacement_unowned",metadata:expect.objectContaining({runnerTaskDispatched:false})})] : []);
  });
 
 });
