@@ -347,7 +347,10 @@ untracked and ignored files, file modes). The `HEAD` reflog and `ORIG_HEAD` are 
 What restore points leave out is moved by rename on the same filesystem: regenerable
 directories such as `node_modules`, untracked `.env` and `.env.*` files,
 `.claude/settings.local.json`, and each nested `.paperclip-repositories/*` checkout as a
-whole. Any other ignored file that a restore point does not save keeps the workspace in
+whole. A standalone nested clone moves as is. A nested checkout that is a worktree of its own
+shared clone moves too, and the move runs `git worktree repair` in that clone so its
+registration follows the new path (a rollback moves it back and repairs it again). Any other
+ignored file that a restore point does not save keeps the workspace in
 place.
 
 The new worktree must then match the old one exactly (HEAD, index, worktree, ignored files,

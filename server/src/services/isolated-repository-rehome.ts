@@ -21,6 +21,7 @@ import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lo
 import { canonicalRepositoryRoot } from "./execution-workspace-source-roots.js";
 import { withExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
 import { loadGitRestorePoint } from "./git-restore-point-storage.js";
+import { readLinkedNestedCheckout, repairMovedNestedRepositoryWorktree } from "./nested-repository-worktrees.js";
 import { getStorageService } from "../storage/index.js";
 
 const execFile = promisify(execFileCallback);
@@ -217,6 +218,22 @@ async function historyKey(cwd: string, admin: string, signal?: AbortSignal) {
   return JSON.stringify([shas(reflog), original.trim()]);
 }
 
+async function repairLinkedCheckout(checkout: string) {
+  const marker = await fs.lstat(path.join(checkout, ".git")).catch(() => null);
+  if (!marker?.isFile()) return;
+  const common = (await git(checkout, ["rev-parse", "--path-format=absolute", "--git-common-dir"])).trim();
+  await repairMovedNestedRepositoryWorktree(path.dirname(common), checkout);
+}
+
+async function linkedCheckoutBases(cwd: string, moves: string[]) {
+  const bases = new Map<string, string>();
+  for (const relative of moves.filter(item => item.startsWith(`${PROJECT_REPOSITORIES_DIR}/`))) {
+    const linked = await readLinkedNestedCheckout(path.join(cwd, relative)).catch(() => { throw new Error("untransferable_managed_checkouts"); });
+    if (linked) bases.set(relative, linked.base);
+  }
+  return bases;
+}
+
 function readPending(workspace: Workspace) {
   const value = workspace.metadata?.[ISOLATED_REPOSITORY_REHOME_PENDING_KEY] as IsolatedRepositoryRehomePending | undefined;
   if (value === undefined) return null;
@@ -250,6 +267,7 @@ async function undoMove(db: Db | Tx, workspaceId: string, pending: IsolatedRepos
       if (!await exists(moved) || await exists(original)) continue;
       await fs.mkdir(path.dirname(original), { recursive: true });
       await fs.rename(moved, original);
+      await repairLinkedCheckout(original).catch(() => undefined);
     }
     await git(pending.base, ["worktree", "remove", "--force", "--force", pending.target]).catch(() => undefined);
     await fs.rm(pending.target, { recursive: true, force: true });
@@ -324,6 +342,7 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         throw new Error("base_branch_diverged");
       }
       const moves = await transferPlan(old.cwd, options.signal);
+      const linkedBases = await linkedCheckoutBases(old.cwd, moves);
       result.from = row.cwd; result.to = target;
       result.candidateBytes = await allocatedBytes(clone, () => { options.signal?.throwIfAborted(); return true; }).catch(() => 0);
       if (options.dryRun) return { ...result, outcome: "dry_run" as const };
@@ -373,6 +392,7 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
           if (await exists(destination)) throw new Error("transfer_conflict");
           await fs.mkdir(path.dirname(destination), { recursive: true });
           await fs.rename(path.join(old.cwd, relative), destination);
+          if (linkedBases.has(relative)) await repairLinkedCheckout(destination);
         }
         await options.hooks?.beforeVerify?.({ from: old.cwd, to: target });
         const after = await currentRestorePointSnapshot(old.cwd, options.signal);
@@ -384,6 +404,8 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         if ((await git(target, ["symbolic-ref", "--short", "HEAD"], { signal: options.signal })).trim() !== branch) throw new Error("branch_identity_changed");
         for (const relative of moves) {
           if (!await exists(path.join(target, relative)) || await exists(path.join(old.cwd, relative))) throw new Error("transfer_incomplete");
+          const base = linkedBases.get(relative);
+          if (base && (await readLinkedNestedCheckout(path.join(target, relative)).catch(() => null))?.base !== base) throw new Error("transfer_incomplete");
         }
         const at = (options.now ?? new Date()).toISOString();
         await db.transaction(async updateTx => {

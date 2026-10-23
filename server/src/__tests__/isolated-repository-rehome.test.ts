@@ -16,6 +16,7 @@ import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { expireReconstructableGitWorkspace } from "../services/git-workspace-expiration.js";
 import { currentRestorePointSnapshot } from "../services/git-restore-point.js";
 import { rehomeIsolatedRepositoryWorkspace } from "../services/isolated-repository-rehome.js";
+import { addNestedRepositoryWorktree, nestedRepositoryBaseCandidates, readLinkedNestedCheckout } from "../services/nested-repository-worktrees.js";
 import { getStorageService } from "../storage/index.js";
 
 const gitEnv = { ...process.env, GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@example.test",
@@ -103,6 +104,24 @@ describeEmbeddedPostgres("isolated repository source re-home", () => {
     return unpushed;
   }
 
+  async function addLinkedNested(f: Awaited<ReturnType<typeof fixture>>) {
+    const location = path.dirname(f.remote), author = path.join(location, "docs-author"), remote = path.join(location, "docs.git");
+    await fs.mkdir(author, { recursive: true });
+    git(author, "init", "--initial-branch=main");
+    await fs.writeFile(path.join(author, "guide.md"), "guide\n"); git(author, "add", "."); git(author, "commit", "-m", "docs");
+    git(location, "clone", "--bare", author, remote);
+    const repoUrl = pathToFileURL(remote).href;
+    const base = (await materializeManagedProjectWorkspace(nestedRepositoryBaseCandidates({ companyId: f.companyId, projectId: f.projectId, repoUrl })[0]!, { repoUrl })).cwd;
+    await ensureManagedRepositoriesIgnored(f.cwd);
+    const checkout = path.join(f.cwd, ".paperclip-repositories", "docs-linked");
+    await fs.mkdir(path.dirname(checkout), { recursive: true });
+    const { branchName } = await addNestedRepositoryWorktree({ base, cwd: checkout, repoUrl, repoRef: null });
+    await fs.writeFile(path.join(checkout, "guide.md"), "edited in the nested worktree\n");
+    return { base, checkout, branchName, realBase: await fs.realpath(base) };
+  }
+
+  const worktreePaths = (base: string) => git(base, "worktree", "list", "--porcelain").split("\n").filter(line => line.startsWith("worktree ")).map(line => line.slice(9));
+
   const gitView = (cwd: string) => ({ branch: git(cwd, "rev-parse", "--abbrev-ref", "HEAD"), head: git(cwd, "rev-parse", "HEAD"),
     status: git(cwd, "status", "--porcelain=v1", "--untracked-files=all"), reflog: git(cwd, "reflog", "show", "--format=%H", "HEAD") });
 
@@ -153,6 +172,40 @@ describeEmbeddedPostgres("isolated repository source re-home", () => {
     expect(await exists(f.clone)).toBe(false);
     expect(await exists(isolatedRemoteSourcePath(f.companyId, f.issueId))).toBe(false);
     expect(await rehomeIsolatedRepositoryWorkspace(db, row)).toMatchObject({ rehomed: false, reason: "not_candidate" });
+  });
+
+  it("moves worktree-backed nested checkouts and repairs their registration in their shared clone", async () => {
+    const f = await fixture();
+    await makeWork(f.cwd);
+    const nested = await addLinkedNested(f);
+    const oldCheckout = await fs.realpath(nested.checkout);
+    const before = await currentRestorePointSnapshot(f.cwd);
+    const result = await rehomeIsolatedRepositoryWorkspace(db, await f.row());
+    expect(result).toMatchObject({ rehomed: true, cloneRemoved: true, reason: null });
+    expect(await currentRestorePointSnapshot(f.target)).toEqual(before);
+    const moved = path.join(f.target, ".paperclip-repositories", "docs-linked");
+    expect(await readLinkedNestedCheckout(moved)).toMatchObject({ base: nested.realBase, checkout: moved });
+    expect(worktreePaths(nested.base)).toContain(moved);
+    expect(worktreePaths(nested.base)).not.toContain(oldCheckout);
+    expect(git(moved, "symbolic-ref", "--short", "HEAD")).toBe(nested.branchName);
+    expect(git(moved, "status", "--porcelain")).toBe("M guide.md");
+    expect(git(nested.base, "worktree", "list", "--porcelain")).not.toContain("prunable");
+  });
+
+  it("restores the registration of worktree-backed nested checkouts when a move rolls back", async () => {
+    const f = await fixture();
+    await makeWork(f.cwd);
+    const nested = await addLinkedNested(f);
+    const oldCheckout = await fs.realpath(nested.checkout);
+    const result = await rehomeIsolatedRepositoryWorkspace(db, await f.row(), { hooks: { beforeVerify: async ({ from, to }) => {
+      expect(worktreePaths(nested.base)).toContain(path.join(to, ".paperclip-repositories", "docs-linked"));
+      await fs.writeFile(path.join(from, "late.txt"), "written by a concurrent run\n");
+    } } });
+    expect(result).toMatchObject({ rehomed: false, reason: "snapshot_mismatch" });
+    expect(await readLinkedNestedCheckout(nested.checkout)).toMatchObject({ base: nested.realBase, checkout: oldCheckout });
+    expect(worktreePaths(nested.base)).toContain(oldCheckout);
+    expect(git(nested.checkout, "status", "--porcelain")).toBe("M guide.md");
+    expect(await exists(f.target)).toBe(false);
   });
 
   it("keeps a workspace with a live run", async () => {
