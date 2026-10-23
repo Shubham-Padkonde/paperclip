@@ -13,7 +13,7 @@ type EnvLine = {
   ending: string;
 };
 
-const ENV_ASSIGNMENT_PATTERN = /^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)(.*)$/;
+const ENV_ASSIGNMENT_PATTERN = /^(\s*(?:export\s+)?)([A-Za-z_][A-Za-z0-9_]*)(\s*=\s*)([\s\S]*)$/;
 const MINIMAL_ENV_VALUE_PATTERN = /^[A-Za-z0-9_./:@-]+$/;
 
 export function encodeEnvValue(value: string, encoding: EnvValueEncoding = "json"): string {
@@ -24,7 +24,7 @@ export function encodeEnvValue(value: string, encoding: EnvValueEncoding = "json
 }
 
 function trailingEnvCommentStart(rawValue: string): number | null {
-  let quote: "\"" | "'" | null = null;
+  let quote: "\"" | "'" | "`" | null = null;
   let escaped = false;
 
   for (let index = 0; index < rawValue.length; index += 1) {
@@ -33,7 +33,7 @@ function trailingEnvCommentStart(rawValue: string): number | null {
       escaped = false;
       continue;
     }
-    if (quote === "\"" && character === "\\") {
+    if (character === "\\" && (quote === "\"" || (quote !== null && rawValue[index + 1] === quote))) {
       escaped = true;
       continue;
     }
@@ -41,7 +41,7 @@ function trailingEnvCommentStart(rawValue: string): number | null {
       if (character === quote) quote = null;
       continue;
     }
-    if (character === "\"" || character === "'") {
+    if (character === "\"" || character === "'" || character === "`") {
       quote = character;
       continue;
     }
@@ -69,10 +69,14 @@ function parseComparableEnvValue(rawValue: string): string | null {
       const parsed = JSON.parse(encodedValue);
       return typeof parsed === "string" ? parsed : null;
     } catch {
+      if (/[\r\n]/.test(encodedValue)) {
+        return encodedValue.slice(1, -1).replace(/\\n/g, "\n").replace(/\\r/g, "\r");
+      }
       return null;
     }
   }
-  if (encodedValue.startsWith("'") && encodedValue.endsWith("'")) {
+  if ((encodedValue.startsWith("'") && encodedValue.endsWith("'"))
+    || (encodedValue.startsWith("`") && encodedValue.endsWith("`"))) {
     return encodedValue.slice(1, -1);
   }
   return encodedValue;
@@ -81,10 +85,17 @@ function parseComparableEnvValue(rawValue: string): string | null {
 function splitEnvLines(contents: string): EnvLine[] {
   const lines: EnvLine[] = [];
   const newlinePattern = /\r\n|\n|\r/g;
+  const quotedAssignmentPattern = /^[^\S\r\n]*(?:export\s+)?[\w.-]+(?:\s*=\s*|:\s+)(?:'(?:\\'|[^'])*'|"(?:\\"|[^"])*"|`(?:\\`|[^`])*`)/gm;
+  let quotedAssignment = quotedAssignmentPattern.exec(contents);
   let lineStart = 0;
   let match: RegExpExecArray | null;
 
   while ((match = newlinePattern.exec(contents)) !== null) {
+    while (quotedAssignment && quotedAssignment.index + quotedAssignment[0].length <= match.index) {
+      quotedAssignment = quotedAssignmentPattern.exec(contents);
+    }
+    if (quotedAssignment && quotedAssignment.index < match.index) continue;
+
     lines.push({
       contents: contents.slice(lineStart, match.index),
       ending: match[0],
@@ -132,7 +143,7 @@ export function updateEnvFileContents(
   }
 
   if (missingEntries.size > 0) {
-    const newline = lines.find((line) => line.ending.length > 0)?.ending ?? "\n";
+    const newline = contents.match(/\r\n|\n|\r/)?.[0] ?? "\n";
     const insertedLines = Array.from(missingEntries, ([key, value]) => ({
       contents: `${key}=${encodeEnvValue(value, valueEncoding)}`,
       ending: newline,
