@@ -5,7 +5,7 @@ import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { environmentLeases, executionWorkspaces, environments, heartbeatRuns, issues, projects, type Db } from "@paperclipai/db";
 import { freshWorkspaceSchema, environmentTaskOperationSchema, parseEnvironmentTaskResult, type PluginEnvironmentTaskOperation } from "@paperclipai/plugin-sdk";
 import { pluginRegistryService } from "./plugin-registry.js";
-import { hasRemoteTerminationReceipt, remoteExecutionHasStopped } from "./remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, remoteExecutionHasStopped, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 
 export async function pluginEnvironmentSupportsTasks(db: Db, workers: PluginWorkerManager, lease: { companyId: string; metadata: Record<string, unknown> | null }) {
@@ -43,7 +43,7 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
   const activeProbe = lease.heartbeatRunId === null && lease.issueId === null && probe
     && typeof probe.runId === "string" && typeof probe.sessionId === "string"
     && typeof probe.expiresAtMs === "number" && probe.expiresAtMs > Date.now();
-  if ((operation.kind === "read_file" || operation.kind === "describe" || operation.kind === "prepare" || operation.kind === "submit" || operation.kind === "connection" || operation.kind === "read_state" || operation.kind === "archive_state" || operation.kind === "check_project_auth" || operation.kind === "copilot_metadata") &&
+  if ((operation.kind === "read_file" || operation.kind === "describe" || operation.kind === "prepare" || operation.kind === "submit" || operation.kind === "connection" || (operation.kind === "read_state" && metadata.runnerTaskExecutionStopped !== true) || operation.kind === "archive_state" || operation.kind === "check_project_auth" || operation.kind === "copilot_metadata") &&
       (metadata.runnerTaskRetiring === true || !environment || (!activeProbe && run?.status !== "running") || lease.status !== "active" || (lease.expiresAt && lease.expiresAt.getTime() <= Date.now()))) throw new Error("Plugin-provided Runner execution lease is not active");
   if (operation.kind === "copilot_metadata" && !activeProbe) throw new Error("Copilot metadata requires a private setup lease");
   const checkpointIdentity = operation.kind === "read_state" || operation.kind === "read_file" ? operation.identity
@@ -63,7 +63,17 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
     && savedIdentity.runId === checkpointIdentity.runId && savedIdentity.sessionId === checkpointIdentity.normalizedSessionId
     && savedIdentity.turnId === checkpointIdentity.turnId && savedIdentity.itemId === checkpointIdentity.itemId;
   if (checkpointIdentity && !resumeFrom && !ownCheckpoint) throw new Error("Plugin Runner state identity mismatch");
-  if (runner && ((!checkpointIdentity || !resumeFrom) && runner.runId !== (activeProbe ? probe.runId : run?.id) || (!resumeFrom && runner.leaseId !== lease.id && !ownCheckpoint)
+  const prior = operation.kind === "prepare" ? operation.priorIdentity : undefined;
+  const priorSaved = metadata.runnerTaskPriorIdentity as Record<string, unknown> | undefined;
+  const matches = (identity: typeof prior, saved: Record<string, unknown> | undefined) => !!identity && !!saved &&
+    identity.runnerInstanceId === saved.runnerId && identity.environmentLeaseId === saved.leaseId &&
+    identity.normalizedSessionId === saved.sessionId && identity.runId === saved.runId &&
+    identity.turnId === saved.turnId && identity.itemId === saved.itemId;
+  const warmAttachment = !!prior && metadata.runnerTaskReused === true &&
+    (matches(prior, savedIdentity) || matches(prior, priorSaved) && operation.kind === "prepare" && matches(operation.requirements.identity, savedIdentity)) && runner?.runnerId === prior.runnerInstanceId &&
+    runner?.leaseId === prior.environmentLeaseId && runner?.sessionId === prior.normalizedSessionId;
+  if (prior && !warmAttachment) throw new Error("Plugin warm task prior identity mismatch");
+  if (runner && ((!checkpointIdentity || !resumeFrom) && runner.runId !== (activeProbe ? probe.runId : run?.id) || (!resumeFrom && runner.leaseId !== lease.id && !ownCheckpoint && !warmAttachment)
     || (activeProbe && (runner.sessionId !== probe.sessionId || (launches && operation.projectIds.length > 0))))) {
     throw new Error("Plugin-provided Runner execution identity mismatch");
   }
@@ -71,6 +81,8 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
     const sources = await db.select({ runId: environmentLeases.heartbeatRunId, metadata: environmentLeases.metadata }).from(environmentLeases).where(and(
       eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.provider, lease.provider!),
       eq(environmentLeases.providerLeaseId, resumeFrom),
+      sql`${environmentLeases.metadata}->>'runnerTaskSessionRetained' = 'true'`,
+      checkpointIdentity ? eq(environmentLeases.heartbeatRunId, checkpointIdentity.runId) : undefined,
     )).limit(2);
     const priorRunId = sources.length === 1 ? sources[0]!.runId : null;
     const sourceIdentity = sources.length === 1 ? sources[0]!.metadata?.runnerTaskIdentity as Record<string, unknown> | undefined : undefined;
@@ -166,7 +178,48 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
     )).returning({ id: environmentLeases.id });
     if (marked.length !== 1) throw new Error("Plugin-provided Runner execution lease is not active");
   }
+  if (warmAttachment && operation.kind === "prepare") {
+    const i = operation.requirements.identity;
+    const marked = await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({
+      runnerTaskPriorIdentity: { runnerId: prior!.runnerInstanceId, leaseId: prior!.environmentLeaseId, runId: prior!.runId,
+        sessionId: prior!.normalizedSessionId, turnId: prior!.turnId, itemId: prior!.itemId },
+      runnerTaskIdentity: { runnerId: i.runnerInstanceId, leaseId: i.environmentLeaseId, runId: i.runId,
+        sessionId: i.normalizedSessionId, turnId: i.turnId, itemId: i.itemId },
+    })}::jsonb` }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "active"),
+      sql`coalesce(${environmentLeases.metadata}->>'runnerTaskRetiring', 'false') != 'true'`,
+      sql`${environmentLeases.metadata}->'runnerTaskIdentity' = ${JSON.stringify(savedIdentity)}::jsonb`)).returning({id:environmentLeases.id});
+    if (marked.length !== 1) throw new Error("Plugin warm task attachment lost authority");
+  }
   try {
+    if (operation.kind === "describe" && metadata.runnerTaskReused === true) {
+      const state = parseEnvironmentTaskResult({kind:"status"}, taskId, await workers.call(plugin.id, "environmentTask", {
+        driverKey: metadata.driverKey, companyId: input.companyId, environmentId: environment?.id ?? null,
+        issueId: lease.issueId, config: driverConfig, taskId, runId: run?.id ?? null, agentId: run?.agentId ?? null,
+        projectIds, lease: {providerLeaseId: taskId, metadata}, operation:{kind:"status"},
+      }));
+      if (state.kind === "status" && state.executionStopped === true) {
+        await executeEnvironmentTask(db, workers, {...input, operation:{kind:"status"}});
+        await executeEnvironmentTask(db, workers, {...input, operation:{kind:"complete"}});
+        // Preserve the predecessor's stop proof for checkpoint authorization.
+        if (typeof metadata.runnerTaskPreviousLeaseId === "string") await db.update(environmentLeases).set({
+          metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({runnerTaskExecutionStopped:true,
+            runnerTaskSessionRetained:state.sessionStateAvailable === true})}::jsonb`,
+        }).where(and(eq(environmentLeases.id, metadata.runnerTaskPreviousLeaseId), eq(environmentLeases.companyId, input.companyId)));
+        const fresh = await workers.call(plugin.id, "environmentAcquireLease", {driverKey:metadata.driverKey,
+          companyId:input.companyId,environmentId:environment!.id,issueId:lease.issueId,config:driverConfig,
+          runId:run!.id,agentId:run!.agentId,adapterType:"paperclip_runner"});
+        if (!fresh.providerLeaseId || fresh.providerLeaseId === taskId) throw new Error("Plugin replacement task identity unavailable");
+        const {runnerTaskIdentity:_identity,runnerTaskPriorIdentity:_prior,runnerTaskCredentialHandoff:_handoff,
+          runnerTaskResumeFrom:_resume,runnerTaskPreviousLeaseId:_previous,...rest}=metadata;
+        const replacement = await db.update(environmentLeases).set({providerLeaseId:fresh.providerLeaseId,
+          metadata:{...rest,providerMetadata:fresh.metadata ?? {},runnerTaskReused:false,runnerTaskDispatched:false,
+            runnerTaskExecutionStopped:false,runnerTaskSessionRetained:false},
+        }).where(and(eq(environmentLeases.id,lease.id),eq(environmentLeases.providerLeaseId,taskId),
+          eq(environmentLeases.status,"active"))).returning({id:environmentLeases.id});
+        if (replacement.length !== 1) throw new Error("Plugin task replacement ownership changed");
+        return executeEnvironmentTask(db, workers, input);
+      }
+    }
     if (operation.kind === "complete") {
       await settlePluginTaskCredentialHandoff(db, { companyId: input.companyId, leaseId: lease.id }, metadata, async accountIdentity => {
         const snapshot = await executeEnvironmentTask(db, workers, { ...input, operation: { kind: "credentials", accountIdentity } });
@@ -221,6 +274,19 @@ export async function executeEnvironmentTask(db: Db, workers: PluginWorkerManage
     if (operation.kind === "complete") {
       if (freshWorkspace && metadata.runnerTaskExecutionStopped === true)
         await releaseProviderRecoveryTransfers(input.companyId, freshWorkspace);
+      // A physical task can back several run leases. Confirm retirement for every prior owner.
+      if (lease.leasePolicy === "reuse_by_environment" && metadata.runnerTaskExecutionStopped === true) {
+        const owners=await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId,input.companyId),
+          eq(environmentLeases.provider,lease.provider!),eq(environmentLeases.providerLeaseId,taskId)));
+        for(const owner of owners) {
+          const receipt=remoteTerminationReceipt(owner,{providerLeaseId:taskId,state:"stopped"});
+          if(!receipt) continue;
+          await db.update(environmentLeases).set({
+            ...(owner.status === "retained" ? {status:"released" as const,releasedAt:new Date(),cleanupStatus:"success" as const}:{}),
+            metadata:sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({remoteExecutionTermination:receipt,runnerTaskExecutionStopped:true})}::jsonb`,
+          }).where(eq(environmentLeases.id,owner.id));
+        }
+      }
       await db.update(environmentLeases).set({
         metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || '{"runnerTaskDispatched":false}'::jsonb`,
       }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, input.companyId),

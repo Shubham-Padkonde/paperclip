@@ -322,3 +322,57 @@ describe("plugin task workspace file transfer", () => {
     } finally {await registration.release();await registration.checkpoint("unsettled");await handle.completion;}
   });
 });
+
+it("reuses a warm Codex process across run authorities without idle status polling", async () => {
+  const {task} = provider();
+  ingress.connect.mockReturnValue({ready:Promise.resolve(),close:async()=>{}});
+  const retained = vi.fn(async()=>{});
+  const input = {task,projectIds:[],harness:"codex",projectAuthCheckVersion:1 as const,warmTaskVersion:1 as const,
+    accountIdentity:"account",credentialIdentity:"revision",pollMs:1,onSessionRetained:retained};
+  const owner = createPluginRunnerTaskOwner(input);
+  await prepare(owner);
+  const registration = await owner.registration({} as never,"run");
+  const spec = launchSpec(); spec.nativeRunner!.lifecyclePolicy = {mode:"warm",idleTimeoutMs:300000};
+  const handle = owner.launcher(spec); registration.activate(); await registration.ready();
+  const observed = task.mock.calls.length;
+  await new Promise(resolve=>setTimeout(resolve,10));
+  expect(task.mock.calls).toHaveLength(observed);
+  const nextTask=vi.fn(task.getMockImplementation()!);
+  owner.rebind({...input,task:nextTask});
+  const nextRegistration=await owner.registration({} as never,"next-run");
+  const nextIdentity={...requirements.identity,runId:"next-run",turnId:"next-turn",itemId:"next-item"};
+  await owner.driver.prepareLaunch!({...requirements,identity:nextIdentity});
+  expect(nextTask.mock.calls[0][0]).toMatchObject({kind:"prepare",priorIdentity:requirements.identity,accountIdentity:"account"});
+  await registration.release(); nextRegistration.activate(); await nextRegistration.ready();
+  expect(nextTask.mock.calls.some(([op])=>op.kind==="submit" || op.kind==="stop" || op.kind==="complete")).toBe(false);
+  await nextRegistration.release(); await nextRegistration.checkpoint("settled"); await handle.completion;
+  expect(retained).toHaveBeenCalledWith(expect.objectContaining(nextIdentity));
+  expect(nextTask.mock.calls.filter(([op])=>op.kind==="stop")).toHaveLength(1);
+});
+
+it("adopts a verified retained Codex task without submitting a replacement", async () => {
+  const {task}=provider();
+  ingress.connect.mockReturnValue({ready:Promise.resolve(),close:async()=>{}});
+  const owner=createPluginRunnerTaskOwner({task,projectIds:[],harness:"codex",projectAuthCheckVersion:1,
+    warmTaskVersion:1,accountIdentity:"account",adoptIdentity:requirements.identity,pollMs:1});
+  expect(await owner.driver.adoptExistingRunner!.isAlive()).toBe(true);
+  const registration=await owner.registration({} as never,"run");
+  registration.activate(); await registration.ready();
+  await registration.release(); await registration.checkpoint("settled");
+  expect(task.mock.calls.some(([op])=>op.kind==="submit")).toBe(false);
+  expect(task.mock.calls.some(([op])=>op.kind==="complete")).toBe(true);
+});
+
+it("refuses warm account or credential generation changes", async()=>{
+  const {task}=provider();
+  const input={task,projectIds:[],harness:"codex",projectAuthCheckVersion:1 as const,warmTaskVersion:1 as const,
+    accountIdentity:"account",credentialIdentity:"revision",pollMs:1};
+  const owner=createPluginRunnerTaskOwner(input);
+  await prepare(owner);
+  const spec=launchSpec();spec.nativeRunner!.lifecyclePolicy={mode:"warm",idleTimeoutMs:300000};
+  const process=owner.launcher(spec);
+  expect(()=>owner.rebind({...input,accountIdentity:"other"})).toThrow("cannot be rebound");
+  expect(()=>owner.rebind({...input,credentialIdentity:"rotated"})).toThrow("cannot be rebound");
+  const registration=await owner.registration({} as never,"run");
+  await registration.checkpoint("unsettled"); await process.completion;
+});

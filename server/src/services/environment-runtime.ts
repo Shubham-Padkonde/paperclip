@@ -3670,7 +3670,36 @@ function createPluginEnvironmentDriver(
         driver.defaultAcquireTimeoutMs,
       );
       const timeoutOverride: [number?] = rpcTimeoutMs === undefined ? [] : [rpcTimeoutMs];
-      const providerLease = await workerManager.call(plugin.id, "environmentAcquireLease", {
+      const warm = input.adapterType === "paperclip_runner" && parsed.config.runnerLifecycleMode === "warm" &&
+        driver.warmTaskVersion === 1 && !!input.issueId && !!input.agentId && !!input.heartbeatRunId &&
+        workerManager.getWorker(plugin.id)?.supportedMethods.includes("environmentResumeLease");
+      const lifecyclePolicy = warm ? { mode: "warm", idleTimeoutMs: parsed.config.runnerIdleTimeoutMs ?? 300_000 } : { mode: "per_turn", idleTimeoutMs: null };
+      const fingerprint = createHash("sha256").update(JSON.stringify([parsed.config, input.agentId])).digest("hex");
+      const candidates = warm ? await db.select().from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.environmentId, input.environment.id),
+        eq(environmentLeases.status, "retained"), eq(environmentLeases.issueId, input.issueId!),
+        sql`${environmentLeases.executionWorkspaceId} IS NOT DISTINCT FROM ${input.executionWorkspaceId ?? null}::uuid`,
+        sql`${environmentLeases.metadata}->>'agentId' = ${input.agentId!}`,
+        sql`${environmentLeases.metadata}->>'runnerTaskFingerprint' = ${fingerprint}`,
+        sql`${environmentLeases.metadata}->>'pluginId' = ${plugin.id}`,
+        sql`${environmentLeases.metadata}->>'driverKey' = ${parsed.config.driverKey}`,
+      )) : [];
+      if (candidates.length > 1) throw new Error("Ambiguous retained plugin task ownership");
+      const previous = candidates[0];
+      let resumed: PluginEnvironmentLease | undefined;
+      if (previous?.providerLeaseId) {
+        // Resume only inspects the exact computer; an unavailable reply must not create a replacement.
+        resumed = await workerManager.call(plugin.id, "environmentResumeLease", {
+          driverKey: parsed.config.driverKey, companyId: input.companyId, environmentId: input.environment.id,
+          issueId: input.issueId, config: parsed.config.driverConfig, runId: input.heartbeatRunId!,
+          providerLeaseId: previous.providerLeaseId, leaseMetadata: previous.metadata ?? undefined,
+        });
+        if (!resumed?.providerLeaseId) {
+          await this.releaseRunLease({ environment: input.environment, lease: toEnvironmentLeaseSnapshot(previous), status: "released" });
+          resumed = undefined;
+        }
+      }
+      const providerLease = resumed ?? await workerManager.call(plugin.id, "environmentAcquireLease", {
         driverKey: parsed.config.driverKey,
         companyId: input.companyId,
         environmentId: input.environment.id,
@@ -3695,11 +3724,14 @@ function createPluginEnvironmentDriver(
         executionWorkspaceId: input.executionWorkspaceId,
         issueId: input.issueId,
         heartbeatRunId: input.heartbeatRunId,
-        leasePolicy: "ephemeral",
+        leasePolicy: warm ? "reuse_by_environment" : "ephemeral",
+        ...(resumed && previous ? { replacesReusableLeaseId: previous.id } : {}),
         provider: `plugin:${parsed.config.pluginKey}:${parsed.config.driverKey}`,
         providerLeaseId: providerLease.providerLeaseId,
         expiresAt: providerAttestedLeaseExpiry(input.requestedExpiresAt, parseExpiresAt(providerLease.expiresAt)),
         metadata: {
+          ...(resumed && previous ? { ...previous.metadata, runnerTaskReused: true, runnerTaskPreviousLeaseId: previous.id } : {}),
+          runnerTaskLifecyclePolicy: lifecyclePolicy, runnerTaskFingerprint: fingerprint, remoteCwd:".",
           ...(input.agentId ? { agentId: input.agentId } : {}),
           providerMetadata: providerLease.metadata ?? {},
           environmentId: input.environment.id,
