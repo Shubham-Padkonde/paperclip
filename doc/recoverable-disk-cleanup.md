@@ -313,3 +313,73 @@ processed in batches of 50; a full batch continues immediately.
 Rows have no foreign keys, so they outlive a deleted workspace, issue or company long
 enough to remove the stored object. Each run that changes anything logs its counts.
 
+
+## Isolated repository sources
+
+For a while, workspace preparation gave some isolated `git_worktree` workspaces their
+own full clone of the project repository under
+`instances/<id>/isolated-repository-sources/<companyId>/<issueId>/checkout`, with the
+issue's worktree inside it. Workspace metadata marks these with `isolatedRemoteSource`.
+New workspaces no longer get one; they are worktrees of the project's shared managed
+clone. Each old clone still holds a full `.git` and an unused default-branch checkout.
+
+With `PAPERCLIP_ISOLATED_SOURCE_REHOME_ENABLED=true` (and git cache expiration enabled),
+the terminal workspace reaper moves each such open workspace onto the shared clone and
+then deletes its private clone. It runs under the same source lock, workspace lifecycle
+lock and Git lock files as git cache expiration, so no run, expiration, reopen or
+restore can interleave. A workspace is moved only when:
+
+- no run, native finalization, environment lease or runtime service is still live for it,
+  and it is not waiting for a reopen to be consumed (the issue may be open);
+- the project has a shared managed clone for the same `repoUrl`;
+- its worktree sits at the standard `.paperclip/worktrees/<branch>` location, and the
+  branch is absent from the shared clone, points to an ancestor of the worktree's HEAD
+  there, and is not checked out in another of its worktrees;
+- its Git state is transferable: no stash or replacement refs, no in-progress merge,
+  rebase or other worktree-specific state, no hidden index flags, no shallow history, and
+  nothing a restore point refuses (submodules, filtered paths, special files, untracked
+  nested repositories, oversized contents).
+
+The move captures a restore point of the old worktree against commits both repositories
+share, imports it into the shared clone, creates or fast-forwards the issue branch, adds
+the new worktree at the same HEAD and applies the restore point (index, worktree changes,
+untracked and ignored files, file modes). The `HEAD` reflog and `ORIG_HEAD` are copied.
+What restore points leave out is moved by rename on the same filesystem: regenerable
+directories such as `node_modules`, untracked `.env` and `.env.*` files,
+`.claude/settings.local.json`, and each nested `.paperclip-repositories/*` checkout as a
+whole. Any other ignored file that a restore point does not save keeps the workspace in
+place.
+
+The new worktree must then match the old one exactly (HEAD, index, worktree, ignored files,
+modes and reflog), and every moved item must exist. Only then does one database update
+point the workspace at the new path, drop `isolatedRemoteSource`, rewrite a saved
+restoration recipe to the shared clone, and record `isolatedRepositoryRehome`
+(`{ at, from, to, cleanedAt }`). Any failure before that update removes the new worktree,
+moves items back, restores the branch, and leaves the old worktree untouched.
+
+After the update, the old worktree is removed and the clone is renamed to trash and
+deleted when nothing else needs it: no other workspace or project workspace refers to it
+(a workspace already expired with its worktree removed does not count), no runtime
+service runs in it, it has no other worktree, its own checkout has no changes or files
+other than regenerable ones, it has only branch, tag and remote-tracking refs, and every
+commit its local refs and reflogs hold is either on a remote-tracking ref or present in the
+shared clone. A clone another workspace still uses is kept (`cloneRetained`); that
+workspace's own move removes it later. If the server stops after the update, a later sweep
+finishes the removal and sets `cleanedAt`.
+
+Each attempt logs `event: "execution_workspace.isolated_source_rehome"` with the outcome,
+skip reason, candidate bytes and reclaimed bytes. A workspace that is skipped, or whose
+clone is kept for a reason that can change, is retried an hour later through the reaper's
+existing deadlines; nothing runs while there is no candidate.
+`PAPERCLIP_ISOLATED_SOURCE_REHOME_DRY_RUN=true` reports candidates without changing
+anything.
+
+Re-homed workspaces get a new path. An agent that resumes an older session may still
+remember the old path; the run's working directory comes from the updated workspace.
+
+Reopening or restoring an expired workspace whose recipe came from a private clone no
+longer recreates that clone when the project has a shared managed clone for the same
+repository and its branch there is absent or at the saved commit. The workspace is
+rebuilt as a worktree of the shared clone at the standard location, with the saved commit
+and restore point imported and applied as before. Without a shared clone, the old
+behavior applies.

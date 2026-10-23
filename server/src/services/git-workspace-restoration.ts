@@ -54,7 +54,7 @@ type Workspace = {
   cwd: string | null; providerRef: string | null; status?: string; metadata: Record<string, unknown> | null;
 };
 
-function managedSourcePaths(workspace: Workspace) {
+export function managedSourcePaths(workspace: Workspace) {
   if (!workspace.projectId || !workspace.repoUrl) return [];
   let repoName: string | null = null;
   try { repoName = new URL(workspace.repoUrl).pathname.replace(/\/+$/, "").split("/").pop()?.replace(/\.git$/i, "") || null; } catch { return []; }
@@ -62,7 +62,7 @@ function managedSourcePaths(workspace: Workspace) {
   return [root, `${root}-${createHash("sha256").update(workspace.repoUrl).digest("hex").slice(0, 12)}`];
 }
 
-async function verifiedGitCacheSource(workspace: Workspace, sourcePath: string) {
+export async function verifiedGitCacheSource(workspace: Workspace, sourcePath: string) {
   const privateSource = recordedIsolatedRemoteSource(workspace);
   if (privateSource) {
     if (sourcePath !== privateSource) throw new GitCacheRestorationFailure();
