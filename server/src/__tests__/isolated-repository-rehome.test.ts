@@ -231,6 +231,13 @@ describeEmbeddedPostgres("isolated repository source re-home", () => {
     const current = await f.row();
     await db.update(executionWorkspaces).set({ metadata: { ...current.metadata, isolatedRepositoryRehomePending: pending } }).where(eq(executionWorkspaces.id, f.workspaceId));
 
+    expect(await rehomeIsolatedRepositoryWorkspace(db, await f.row(), { dryRun: true }))
+      .toMatchObject({ outcome: "dry_run", rehomed: false, reason: "interrupted_rehome_pending" });
+    expect(await exists(path.join(f.target, "node_modules", "pkg", "index.js"))).toBe(true);
+    expect(await exists(path.join(f.cwd, ".env"))).toBe(false);
+    expect(git(f.sharedPath, "rev-parse", "refs/heads/fixture-task")).toBe(head);
+    expect((await f.row()).metadata?.isolatedRepositoryRehomePending).toEqual(pending);
+
     const result = await rehomeIsolatedRepositoryWorkspace(db, await f.row());
     expect(result).toMatchObject({ rehomed: true, cloneRemoved: true, reason: null });
     expect(await currentRestorePointSnapshot(f.target)).toEqual(before);

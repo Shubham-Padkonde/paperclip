@@ -359,7 +359,7 @@ moves items back, restores the branch, and leaves the old worktree untouched. Be
 changes the shared clone, the move records `isolatedRepositoryRehomePending` (target, branch,
 previous branch tip and planned moves). If the server stops before the update, the next
 attempt uses that record to move items back, remove the new worktree and restore the
-branch, then starts again. A new worktree is removed only when the move created it: a
+branch, then starts again. A dry run reports such a record without undoing it. A new worktree is removed only when the move created it: a
 target that appears from elsewhere is never deleted.
 
 After the update, the old worktree is removed and the clone is renamed to trash and

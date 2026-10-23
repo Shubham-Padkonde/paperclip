@@ -314,6 +314,7 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
       if (interrupted) {
         if (interrupted.base !== base || interrupted.from !== old.cwd || interrupted.branch !== branch
           || interrupted.target !== path.join(await fs.realpath(base), standardWorktreeSuffix(branch))) throw new Error("invalid_rehome_record");
+        if (options.dryRun) return { ...result, outcome: "dry_run" as const, reason: "interrupted_rehome_pending", from: row.cwd, to: interrupted.target };
         await undoMove(tx, row.id, interrupted);
         await writePending(db, row.id, null);
       }
