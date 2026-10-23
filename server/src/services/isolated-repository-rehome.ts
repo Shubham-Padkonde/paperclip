@@ -20,6 +20,8 @@ import { ensureManagedRepositoriesIgnored } from "./managed-repository-checkout.
 import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
 import { canonicalRepositoryRoot } from "./execution-workspace-source-roots.js";
 import { withExecutionWorkspaceLifecycleLock } from "./execution-workspace-lifecycle-lock.js";
+import { loadGitRestorePoint } from "./git-restore-point-storage.js";
+import { getStorageService } from "../storage/index.js";
 
 const execFile = promisify(execFileCallback);
 const SHA = /^[0-9a-f]{40}$/;
@@ -28,11 +30,14 @@ const CLOSED_STATUSES = ["archived", "cleanup_failed"];
 const ADMIN_ENTRIES = new Set(["HEAD", "ORIG_HEAD", "FETCH_HEAD", "index", "commondir", "gitdir", "logs", "refs", "COMMIT_EDITMSG"]);
 const MAX_BOUNDARY_COMMITS = 64;
 export const ISOLATED_REPOSITORY_REHOME_KEY = "isolatedRepositoryRehome";
+export const ISOLATED_REPOSITORY_REHOME_PENDING_KEY = "isolatedRepositoryRehomePending";
 
 type Workspace = typeof executionWorkspaces.$inferSelect;
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 export type IsolatedRepositoryRehomeRecord = { at: string; from: string; to: string; cleanedAt: string | null; cloneRetained?: string };
+export type IsolatedRepositoryRehomePending = { base: string; from: string; target: string; branch: string; head: string; previousTip: string | null; moves: string[] };
 export type IsolatedRepositoryRehomeHooks = {
+  beforeWorktreeAdd?: (input: { from: string; to: string }) => Promise<void>;
   beforeVerify?: (input: { from: string; to: string }) => Promise<void>;
   afterDatabaseUpdate?: (workspace: Workspace) => Promise<void>;
 };
@@ -54,7 +59,7 @@ function readRehome(workspace: Pick<Workspace, "metadata">) {
 
 export function hasPendingIsolatedRepositoryRehomeCleanup(workspace: Workspace) {
   const rehome = readRehome(workspace);
-  return Boolean(rehome && !rehome.cleanedAt && workspace.providerType !== "plugin" && OPEN_STATUSES.includes(workspace.status));
+  return Boolean(rehome && !rehome.cleanedAt && workspace.providerType !== "plugin");
 }
 
 async function git(cwd: string, args: string[], options: { signal?: AbortSignal; input?: string; timeout?: number } = {}) {
@@ -212,21 +217,52 @@ async function historyKey(cwd: string, admin: string, signal?: AbortSignal) {
   return JSON.stringify([shas(reflog), original.trim()]);
 }
 
-type Created = { target: string | null; branchRef: string; branchCreated: boolean; previousTip: string | null; head: string; config: string[]; moved: string[] };
+function readPending(workspace: Workspace) {
+  const value = workspace.metadata?.[ISOLATED_REPOSITORY_REHOME_PENDING_KEY] as IsolatedRepositoryRehomePending | undefined;
+  if (value === undefined) return null;
+  if (!value || typeof value !== "object" || ![value.base, value.from, value.target, value.branch, value.head].every(item => typeof item === "string")
+    || !SHA.test(value.head) || (value.previousTip !== null && !SHA.test(value.previousTip)) || !Array.isArray(value.moves)
+    || value.moves.some(item => typeof item !== "string" || !item || path.isAbsolute(item) || item.split("/").includes(".."))) throw new Error("invalid_rehome_record");
+  return value;
+}
 
-async function rollback(base: string, from: string, created: Created) {
-  for (const relative of [...created.moved].reverse()) {
-    await fs.mkdir(path.dirname(path.join(from, relative)), { recursive: true }).catch(() => undefined);
-    await fs.rename(path.join(created.target!, relative), path.join(from, relative)).catch(() => undefined);
+async function writePending(db: Db, workspaceId: string, value: IsolatedRepositoryRehomePending | null) {
+  await db.update(executionWorkspaces).set({ metadata: value
+    ? sql`coalesce(${executionWorkspaces.metadata}, '{}'::jsonb) || jsonb_build_object(${ISOLATED_REPOSITORY_REHOME_PENDING_KEY}::text, ${JSON.stringify(value)}::jsonb)`
+    : sql`${executionWorkspaces.metadata} - ${ISOLATED_REPOSITORY_REHOME_PENDING_KEY}::text` }).where(eq(executionWorkspaces.id, workspaceId));
+}
+
+async function provenTarget(db: Db | Tx, workspaceId: string, pending: IsolatedRepositoryRehomePending) {
+  const stat = await fs.lstat(pending.target).catch(() => null);
+  if (!stat?.isDirectory() || stat.isSymbolicLink() || !(await fs.lstat(path.join(pending.target, ".git")).catch(() => null))?.isFile()) return false;
+  const common = (await git(pending.target, ["rev-parse", "--path-format=absolute", "--git-common-dir"]).catch(() => "")).trim();
+  if (common !== path.join(await fs.realpath(pending.base), ".git")) return false;
+  if ((await git(pending.target, ["symbolic-ref", "-q", "HEAD"]).catch(() => "")).trim() !== `refs/heads/${pending.branch}`) return false;
+  const [other] = await db.select({ id: executionWorkspaces.id }).from(executionWorkspaces).where(and(ne(executionWorkspaces.id, workspaceId),
+    sql`(${executionWorkspaces.cwd} = ${pending.target} OR ${executionWorkspaces.providerRef} = ${pending.target})`)).limit(1);
+  return !other;
+}
+
+async function undoMove(db: Db | Tx, workspaceId: string, pending: IsolatedRepositoryRehomePending, ownsTarget?: boolean) {
+  if (ownsTarget ?? await provenTarget(db, workspaceId, pending)) {
+    for (const relative of [...pending.moves].reverse()) {
+      const moved = path.join(pending.target, relative), original = path.join(pending.from, relative);
+      if (!await exists(moved) || await exists(original)) continue;
+      await fs.mkdir(path.dirname(original), { recursive: true });
+      await fs.rename(moved, original);
+    }
+    await git(pending.base, ["worktree", "remove", "--force", "--force", pending.target]).catch(() => undefined);
+    await fs.rm(pending.target, { recursive: true, force: true });
+    await git(pending.base, ["worktree", "prune"]).catch(() => undefined);
   }
-  if (created.target) {
-    await git(base, ["worktree", "remove", "--force", "--force", created.target]).catch(() => undefined);
-    await fs.rm(created.target, { recursive: true, force: true }).catch(() => undefined);
-    await git(base, ["worktree", "prune"]).catch(() => undefined);
+  const branchRef = `refs/heads/${pending.branch}`;
+  const tip = (await git(pending.base, ["rev-parse", "--verify", "-q", `${branchRef}^{commit}`]).catch(() => "")).trim();
+  if (tip !== pending.head || (await git(pending.base, ["worktree", "list", "--porcelain"])).split("\n").includes(`branch ${branchRef}`)) return;
+  if (pending.previousTip) await git(pending.base, ["update-ref", branchRef, pending.previousTip, pending.head]);
+  else {
+    await git(pending.base, ["update-ref", "-d", branchRef, pending.head]);
+    for (const key of ["remote", "merge"]) await git(pending.base, ["config", "--local", "--unset-all", `branch.${pending.branch}.${key}`]).catch(() => undefined);
   }
-  if (created.branchCreated) await git(base, ["update-ref", "-d", created.branchRef, created.head]).catch(() => undefined);
-  else if (created.previousTip) await git(base, ["update-ref", created.branchRef, created.previousTip, created.head]).catch(() => undefined);
-  for (const key of created.config) await git(base, ["config", "--local", "--unset-all", key]).catch(() => undefined);
 }
 
 function withRehomeLocks<T>(db: Db, workspace: Workspace, work: (tx: Tx) => Promise<T>) {
@@ -274,6 +310,13 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
       const base = await sharedManagedBase(row);
       const branch = row.branchName!;
       const branchRef = `refs/heads/${branch}`;
+      const interrupted = readPending(row);
+      if (interrupted) {
+        if (interrupted.base !== base || interrupted.from !== old.cwd || interrupted.branch !== branch
+          || interrupted.target !== path.join(await fs.realpath(base), standardWorktreeSuffix(branch))) throw new Error("invalid_rehome_record");
+        await undoMove(tx, row.id, interrupted);
+        await writePending(db, row.id, null);
+      }
       const target = await targetWorktree(tx, row, base, branch, options.signal);
       const previousTip = (await git(base, ["rev-parse", "--verify", "-q", `${branchRef}^{commit}`], { signal: options.signal }).catch(() => "")).trim() || null;
       if (previousTip && !await git(old.cwd, ["merge-base", "--is-ancestor", previousTip, "HEAD"], { signal: options.signal }).then(() => true, () => false)) {
@@ -286,8 +329,8 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
       const admins = [path.basename(old.admin)];
       const locks = await acquireGitExpirationLocks(rehomeLockLocations(clone, admins, branch), lockToken(row.id))
         .catch(() => { throw new Error("worktree_git_busy"); });
-      const created: Created = { target: null, branchRef, branchCreated: false, previousTip, head: old.head, config: [], moved: [] };
-      let committed = false;
+      const pending: IsolatedRepositoryRehomePending = { base, from: old.cwd, target, branch, head: old.head, previousTip, moves };
+      let recorded = false, ownsTarget = false, committed = false;
       try {
         const before = await currentRestorePointSnapshot(old.cwd, options.signal);
         const beforeHistory = await historyKey(old.cwd, old.admin, options.signal);
@@ -300,20 +343,21 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         const history = [old.head, ...reflog, ...(SHA.test(original) ? [original] : [])];
         const present = await presentCommits(base, history, options.signal);
         if (history.some(sha => !present.has(sha))) throw new Error("history_not_transferred");
+        await writePending(db, row.id, pending);
+        recorded = true;
         if (previousTip) await git(base, ["update-ref", branchRef, old.head, previousTip], { signal: options.signal });
         else {
           await git(base, ["update-ref", branchRef, old.head, ""], { signal: options.signal });
-          created.branchCreated = true;
           for (const key of ["remote", "merge"]) {
             const value = (await git(old.cwd, ["config", "--local", "--get", `branch.${branch}.${key}`]).catch(() => "")).trim();
-            if (!value) continue;
-            await git(base, ["config", "--local", `branch.${branch}.${key}`, value], { signal: options.signal });
-            created.config.push(`branch.${branch}.${key}`);
+            if (value) await git(base, ["config", "--local", `branch.${branch}.${key}`, value], { signal: options.signal });
           }
         }
         await fs.mkdir(path.dirname(target), { recursive: true });
-        created.target = target;
+        await options.hooks?.beforeWorktreeAdd?.({ from: old.cwd, to: target });
+        if (await exists(target)) throw new Error("target_worktree_exists");
         await git(base, ["worktree", "add", target, branch], { signal: options.signal, timeout: 15 * 60_000 });
+        ownsTarget = true;
         if (manifest) await applyRestorePoint({ cwd: target, manifest, signal: options.signal });
         const newAdmin = (await git(target, ["rev-parse", "--absolute-git-dir"], { signal: options.signal })).trim();
         await fs.mkdir(path.join(newAdmin, "logs"), { recursive: true });
@@ -328,7 +372,6 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
           if (await exists(destination)) throw new Error("transfer_conflict");
           await fs.mkdir(path.dirname(destination), { recursive: true });
           await fs.rename(path.join(old.cwd, relative), destination);
-          created.moved.push(relative);
         }
         await options.hooks?.beforeVerify?.({ from: old.cwd, to: target });
         const after = await currentRestorePointSnapshot(old.cwd, options.signal);
@@ -349,6 +392,7 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
           const metadata: Record<string, unknown> = { ...current.metadata };
           delete metadata.isolatedRemoteSource;
           delete metadata.gitCacheExpiration;
+          delete metadata[ISOLATED_REPOSITORY_REHOME_PENDING_KEY];
           if (recipe) metadata[GIT_CACHE_RESTORATION_KEY] = { ...recipe, sourceKind: "managed_project", sourcePath: base, worktreePath: target };
           metadata[ISOLATED_REPOSITORY_REHOME_KEY] = { at, from: current.cwd ?? old.cwd, to: target, cleanedAt: null } satisfies IsolatedRepositoryRehomeRecord;
           await updateTx.update(executionWorkspaces).set({ cwd: target, providerRef: current.providerRef ? target : null, metadata, updatedAt: new Date() })
@@ -356,7 +400,10 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         });
         committed = true;
       } finally {
-        if (!committed) await rollback(base, old.cwd, created);
+        if (!committed && recorded) {
+          await undoMove(tx, row.id, pending, ownsTarget);
+          await writePending(db, row.id, null);
+        }
         await locks.release().catch(() => undefined);
       }
       result.rehomed = true;
@@ -488,6 +535,11 @@ export async function rehomeExpiredIsolatedRestoration(db: Db, snapshot: Workspa
     const target = await targetWorktree(db, snapshot, base, recipe.branchName);
     const tip = (await git(base, ["rev-parse", "--verify", "-q", `refs/heads/${recipe.branchName}^{commit}`]).catch(() => "")).trim();
     if (tip && tip !== recipe.commit) return snapshot;
+    if (recipe.restorePoint && !recipe.restorePoint.headOnRemote && !recipe.restorePoint.expiredAt) {
+      const { manifest } = await loadGitRestorePoint({ storage: getStorageService(), workspace: { companyId: snapshot.companyId, id: snapshot.id }, ref: recipe.restorePoint });
+      const present = await presentCommits(base, manifest.prerequisites);
+      if (manifest.prerequisites.some(sha => !present.has(sha))) return snapshot;
+    }
     await finishGitCacheTrash(snapshot);
     return await withExecutionWorkspaceLifecycleLock(db, snapshot.id, async tx => {
       const [row] = await tx.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, snapshot.id)).for("update");

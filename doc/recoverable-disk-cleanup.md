@@ -355,7 +355,12 @@ modes and reflog), and every moved item must exist. Only then does one database 
 point the workspace at the new path, drop `isolatedRemoteSource`, rewrite a saved
 restoration recipe to the shared clone, and record `isolatedRepositoryRehome`
 (`{ at, from, to, cleanedAt }`). Any failure before that update removes the new worktree,
-moves items back, restores the branch, and leaves the old worktree untouched.
+moves items back, restores the branch, and leaves the old worktree untouched. Before it
+changes the shared clone, the move records `isolatedRepositoryRehomePending` (target, branch,
+previous branch tip and planned moves). If the server stops before the update, the next
+attempt uses that record to move items back, remove the new worktree and restore the
+branch, then starts again. A new worktree is removed only when the move created it: a
+target that appears from elsewhere is never deleted.
 
 After the update, the old worktree is removed and the clone is renamed to trash and
 deleted when nothing else needs it: no other workspace or project workspace refers to it
@@ -365,7 +370,7 @@ other than regenerable ones, it has only branch, tag and remote-tracking refs, a
 commit its local refs and reflogs hold is either on a remote-tracking ref or present in the
 shared clone. A clone another workspace still uses is kept (`cloneRetained`); that
 workspace's own move removes it later. If the server stops after the update, a later sweep
-finishes the removal and sets `cleanedAt`.
+finishes the removal and sets `cleanedAt`, also after the workspace has been archived.
 
 Each attempt logs `event: "execution_workspace.isolated_source_rehome"` with the outcome,
 skip reason, candidate bytes and reclaimed bytes. A workspace that is skipped, or whose
@@ -379,7 +384,8 @@ remember the old path; the run's working directory comes from the updated worksp
 
 Reopening or restoring an expired workspace whose recipe came from a private clone no
 longer recreates that clone when the project has a shared managed clone for the same
-repository and its branch there is absent or at the saved commit. The workspace is
+repository, its branch there is absent or at the saved commit, and the shared clone has
+every commit the saved restore point bundle needs as a base. The workspace is
 rebuilt as a worktree of the shared clone at the standard location, with the saved commit
 and restore point imported and applied as before. Without a shared clone, the old
 behavior applies.

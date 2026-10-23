@@ -80,7 +80,7 @@ describeEmbeddedPostgres("isolated repository source re-home", () => {
     await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, issueId));
     const row = () => db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId)).then(rows => rows[0]!);
     const target = path.join(await fs.realpath(root), path.relative(root, sharedPath), ".paperclip", "worktrees", "fixture-task");
-    return { companyId, issueId, workspaceId, projectId, cwd: realized.cwd, clone, sharedPath, target, repoUrl, row };
+    return { companyId, issueId, workspaceId, projectId, cwd: realized.cwd, clone, sharedPath, target, repoUrl, remote, author, row };
   }
 
   async function makeWork(cwd: string) {
@@ -217,6 +217,43 @@ describeEmbeddedPostgres("isolated repository source re-home", () => {
     expect(git(f.sharedPath, "worktree", "list", "--porcelain").split("\n").filter(line => line.startsWith("worktree "))).toHaveLength(1);
   });
 
+  it("undoes a move interrupted before the database update and then completes it", async () => {
+    const f = await fixture();
+    await makeWork(f.cwd);
+    const before = await currentRestorePointSnapshot(f.cwd);
+    const from = await fs.realpath(f.cwd);
+    const head = git(f.cwd, "rev-parse", "HEAD");
+    git(f.sharedPath, "fetch", "-q", f.clone, "refs/heads/fixture-task:refs/heads/fixture-task");
+    git(f.sharedPath, "worktree", "add", "-q", f.target, "fixture-task");
+    await fs.rename(path.join(f.cwd, "node_modules"), path.join(f.target, "node_modules"));
+    await fs.rename(path.join(f.cwd, ".env"), path.join(f.target, ".env"));
+    const pending = { base: f.sharedPath, from, target: f.target, branch: "fixture-task", head, previousTip: null, moves: [".env", "node_modules"] };
+    const current = await f.row();
+    await db.update(executionWorkspaces).set({ metadata: { ...current.metadata, isolatedRepositoryRehomePending: pending } }).where(eq(executionWorkspaces.id, f.workspaceId));
+
+    const result = await rehomeIsolatedRepositoryWorkspace(db, await f.row());
+    expect(result).toMatchObject({ rehomed: true, cloneRemoved: true, reason: null });
+    expect(await currentRestorePointSnapshot(f.target)).toEqual(before);
+    expect(await fs.readFile(path.join(f.target, ".env"), "utf8")).toBe("LOCAL_SETTING=1\n");
+    expect(await fs.readFile(path.join(f.target, "node_modules", "pkg", "index.js"), "utf8")).toBe("module.exports = 1;\n");
+    expect((await f.row()).metadata?.isolatedRepositoryRehomePending).toBeUndefined();
+  });
+
+  it("never deletes a target worktree another workspace created during the move", async () => {
+    const f = await fixture();
+    await makeWork(f.cwd);
+    const before = await currentRestorePointSnapshot(f.cwd);
+    const result = await rehomeIsolatedRepositoryWorkspace(db, await f.row(), { hooks: { beforeWorktreeAdd: async ({ to }) => {
+      await fs.mkdir(to, { recursive: true });
+      await fs.writeFile(path.join(to, "other.txt"), "another workspace\n");
+    } } });
+    expect(result).toMatchObject({ rehomed: false, reason: "target_worktree_exists" });
+    expect(await fs.readFile(path.join(f.target, "other.txt"), "utf8")).toBe("another workspace\n");
+    await fs.rm(f.target, { recursive: true });
+    await expectUntouched(f, before);
+    expect((await f.row()).metadata?.isolatedRepositoryRehomePending).toBeUndefined();
+  });
+
   it("keeps the clone while another workspace still references it", async () => {
     const f = await fixture();
     await makeWork(f.cwd);
@@ -240,6 +277,7 @@ describeEmbeddedPostgres("isolated repository source re-home", () => {
     expect(await exists(f.clone)).toBe(true);
     expect(await currentRestorePointSnapshot(f.target)).toEqual(before);
 
+    await db.update(executionWorkspaces).set({ status: "archived", closedAt: new Date() }).where(eq(executionWorkspaces.id, f.workspaceId));
     const service = executionWorkspaceService(db, { gitCacheExpirationEnabled: true, isolatedSourceRehomeEnabled: true });
     await service.sweepTerminalWorkspaces();
     expect(await exists(f.clone)).toBe(false);
@@ -290,5 +328,34 @@ describeEmbeddedPostgres("isolated repository source re-home", () => {
     expect(await fs.readFile(path.join(f.target, "marker.txt"), "utf8")).toBe("unstaged edit\n");
     expect(await fs.readFile(path.join(f.target, "notes", "todo.md"), "utf8")).toBe("untracked work\n");
     expect(await fs.readFile(path.join(f.target, "build.tsbuildinfo"), "utf8")).toBe("ignored output\n");
+  });
+
+  it("restores through the private clone when the shared clone lacks the restore point's base commits", async () => {
+    const f = await fixture({ issueStatus: "done" });
+    await fs.writeFile(path.join(f.author, "marker.txt"), "commit C\n");
+    git(f.author, "commit", "-qam", "C");
+    git(f.author, "push", "-q", f.remote, "main");
+    const upstream = git(f.author, "rev-parse", "HEAD");
+    git(f.cwd, "fetch", "-q", "origin");
+    git(f.cwd, "reset", "-q", "--hard", "origin/main");
+    await fs.writeFile(path.join(f.cwd, "marker.txt"), "commit D (unpushed)\n");
+    git(f.cwd, "commit", "-qam", "D unpushed");
+    const unpushed = git(f.cwd, "rev-parse", "HEAD");
+    await fs.writeFile(path.join(f.cwd, "notes.txt"), "untracked work\n");
+    const expired = await expireReconstructableGitWorkspace(db, await f.row(), { dryRun: false, expireBase: true, now: new Date(),
+      restorePoint: { storage: getStorageService(), notBefore: new Date(Date.now() - DAY_MS), keyDurable: true } });
+    expect(expired).toMatchObject({ expired: true, restorePoint: true });
+    await fs.rm(f.clone, { recursive: true, force: true });
+    expect(() => git(f.sharedPath, "cat-file", "-e", `${upstream}^{commit}`)).toThrow();
+
+    const reopened = await executionWorkspaceService(db).reopenClosedIsolatedExecutionWorkspaceForIssue({ workspaceId: f.workspaceId,
+      issue: { id: f.issueId, companyId: f.companyId, projectId: f.projectId }, actor: { actorType: "user", agentId: null },
+      authorizationActor: { type: "board", source: "local_implicit", isInstanceAdmin: true } });
+    expect(reopened).toMatchObject({ ok: true, reopened: true });
+    const row = await f.row();
+    expect(row.cwd).toBe(f.cwd);
+    expect(row.metadata?.isolatedRemoteSource).toBeDefined();
+    expect(git(f.cwd, "rev-parse", "HEAD")).toBe(unpushed);
+    expect(await fs.readFile(path.join(f.cwd, "notes.txt"), "utf8")).toBe("untracked work\n");
   });
 });
